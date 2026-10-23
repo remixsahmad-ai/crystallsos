@@ -1,0 +1,330 @@
+name: Build Crystalline OS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-iso.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crystalline-os-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Debian Live ISO
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            live-build \
+            debootstrap \
+            xorriso \
+            squashfs-tools \
+            mtools \
+            dosfstools \
+            grub-pc-bin \
+            grub-efi-amd64-bin \
+            debian-archive-keyring \
+            ca-certificates \
+            file
+
+      - name: Configure Crystalline OS
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p iso
+          cd iso
+
+          lb config \
+            --mode debian \
+            --architecture amd64 \
+            --distribution bookworm \
+            --archive-areas "main contrib non-free non-free-firmware" \
+            --binary-images iso-hybrid \
+            --debian-installer false \
+            --apt-recommends true \
+            --apt-indices false \
+            --memtest none \
+            --bootappend-live "boot=live components quiet splash"
+
+      - name: Add desktop and compatibility packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p iso/config/package-lists
+
+          cat > iso/config/package-lists/crystalline.list.chroot <<'EOF'
+          kde-plasma-desktop
+          sddm
+          network-manager
+          pipewire
+          wireplumber
+          pavucontrol
+          konsole
+          dolphin
+          firefox-esr
+          flatpak
+          python3
+          python3-venv
+          python3-pip
+          git
+          curl
+          wget
+          ca-certificates
+          fonts-noto-core
+          fonts-noto-extra
+          fonts-noto-ui-core
+          fonts-noto-ui-extra
+          fonts-noto-color-emoji
+          fontconfig
+          wine
+          wine64
+          winetricks
+          qemu-system-x86
+          qemu-utils
+          ovmf
+          virt-manager
+          libvirt-daemon-system
+          libvirt-clients
+          spice-vdagent
+          EOF
+
+      - name: Install Crystalline theme and AI helper
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          BASE="iso/config/includes.chroot"
+
+          mkdir -p \
+            "$BASE/etc/fonts/conf.d" \
+            "$BASE/etc/skel/.config" \
+            "$BASE/etc/skel/Desktop" \
+            "$BASE/usr/local/bin" \
+            "$BASE/usr/share/icons/hicolor/scalable/apps" \
+            "$BASE/etc/crystalline"
+
+          # Prefer a redistributable Arabic font with a clean,
+          # Apple-inspired appearance.
+          cat > "$BASE/etc/fonts/conf.d/60-crystalline-arabic.conf" <<'EOF'
+          <?xml version="1.0"?>
+          <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+          <fontconfig>
+            <match>
+              <test name="lang" compare="contains">
+                <string>ar</string>
+              </test>
+              <edit name="family" mode="prepend" binding="strong">
+                <string>Noto Sans Arabic</string>
+              </edit>
+            </match>
+            <alias>
+              <family>sans-serif</family>
+              <prefer>
+                <family>Noto Sans Arabic</family>
+                <family>Noto Sans</family>
+                <family>DejaVu Sans</family>
+              </prefer>
+            </alias>
+          </fontconfig>
+          EOF
+
+          # Default KDE fonts for newly created users.
+          cat > "$BASE/etc/skel/.config/kdeglobals" <<'EOF'
+          [General]
+          font=Noto Sans Arabic,10,-1,5,50,0,0,0,0,0
+          menuFont=Noto Sans Arabic,10,-1,5,50,0,0,0,0,0
+          smallestReadableFont=Noto Sans Arabic,9,-1,5,50,0,0,0,0,0
+          toolBarFont=Noto Sans Arabic,10,-1,5,50,0,0,0,0,0
+
+          [WM]
+          activeFont=Noto Sans Arabic,10,-1,5,50,0,0,0,0,0
+          EOF
+
+          # Dark appearance and KWin blur preference.
+          cat > "$BASE/etc/skel/.config/kwinrc" <<'EOF'
+          [Compositing]
+          Enabled=true
+          Backend=OpenGL
+
+          [Plugins]
+          blurEnabled=true
+          EOF
+
+          # Crystalline X icon.
+          cat > "$BASE/usr/share/icons/hicolor/scalable/apps/crystalline-x.svg" <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+            <rect width="100" height="100" rx="22" fill="#15171b"/>
+            <path d="M27 27 L73 73 M73 27 L27 73"
+              stroke="#00e676" stroke-width="10" stroke-linecap="round"/>
+            <path d="M27 27 L73 73 M73 27 L27 73"
+              stroke="#b9ffd8" stroke-opacity=".4"
+              stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          EOF
+
+          # Safe API client: sends prompts to either provider.
+          # It never executes returned commands.
+          cat > "$BASE/usr/local/bin/crystalline-ai" <<'PYEOF'
+          #!/usr/bin/python3
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          def post(url, headers, payload):
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      **headers,
+                      "Content-Type": "application/json"
+                  },
+                  method="POST"
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=45) as r:
+                      return json.loads(r.read().decode())
+              except urllib.error.HTTPError as e:
+                  detail = e.read().decode(errors="replace")
+                  raise RuntimeError(
+                      f"API HTTP {e.code}: {detail[:500]}"
+                  )
+
+          def ask(provider, prompt):
+              if provider == "gemini":
+                  key = os.environ.get("GEMINI_API_KEY")
+                  if not key:
+                      raise RuntimeError("GEMINI_API_KEY is not set")
+                  model = os.environ.get(
+                      "GEMINI_MODEL", "gemini-2.5-flash"
+                  )
+                  url = (
+                      "https://generativelanguage.googleapis.com/"
+                      "v1beta/models/" + model +
+                      ":generateContent?key=" + key
+                  )
+                  data = post(url, {}, {
+                      "contents": [{
+                          "parts": [{"text": prompt}]
+                      }],
+                      "generationConfig": {
+                          "temperature": 0.2,
+                          "maxOutputTokens": 1500
+                      }
+                  })
+                  return "\n".join(
+                      p.get("text", "")
+                      for c in data.get("candidates", [])
+                      for p in c.get("content", {}).get("parts", [])
+                      if p.get("text")
+                  )
+
+              if provider == "claude":
+                  key = os.environ.get("ANTHROPIC_API_KEY")
+                  if not key:
+                      raise RuntimeError("ANTHROPIC_API_KEY is not set")
+                  model = os.environ.get(
+                      "CLAUDE_MODEL", "claude-sonnet-4-20250514"
+                  )
+                  data = post(
+                      "https://api.anthropic.com/v1/messages",
+                      {
+                          "x-api-key": key,
+                          "anthropic-version": "2023-06-01"
+                      },
+                      {
+                          "model": model,
+                          "max_tokens": 1500,
+                          "messages": [{
+                              "role": "user",
+                              "content": prompt
+                          }]
+                      }
+                  )
+                  return "\n".join(
+                      x.get("text", "")
+                      for x in data.get("content", [])
+                      if x.get("type") == "text"
+                  )
+
+              raise RuntimeError("Choose gemini or claude")
+
+          def main():
+              if len(sys.argv) < 3:
+                  print(
+                      "Usage: crystalline-ai gemini|claude 'question'",
+                      file=sys.stderr
+                  )
+                  return 2
+              prompt = " ".join(sys.argv[2:])
+              if len(prompt) > 12000:
+                  print("Prompt too long", file=sys.stderr)
+                  return 2
+              try:
+                  print(ask(sys.argv[1], prompt))
+                  return 0
+              except (RuntimeError, urllib.error.URLError) as e:
+                  print("Error:", e, file=sys.stderr)
+                  return 1
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+
+          chmod 0755 "$BASE/usr/local/bin/crystalline-ai"
+
+          cat > "$BASE/etc/crystalline/README.txt" <<'EOF'
+          Crystalline AI helper
+
+          Run:
+            crystalline-ai gemini "Explain this error"
+            crystalline-ai claude "Review this proposed solution"
+
+          Configure GEMINI_API_KEY and ANTHROPIC_API_KEY in your
+          local shell after installation.
+
+          Never commit API keys to GitHub or embed them in the ISO.
+          AI output is untrusted. Review commands before running them.
+          This helper does not automatically repair the system.
+          EOF
+
+      - name: Build ISO
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd iso
+          sudo lb build 2>&1 | tee ../build.log
+          ISO="$(find . -maxdepth 1 -type f -name '*.iso' -print -quit)"
+          test -n "$ISO"
+          test -s "$ISO"
+          file "$ISO"
+          sudo chown "$USER":"$USER" "$ISO"
+
+      - name: Upload ISO and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crystalline-OS-ISO
+          path: |
+            iso/*.iso
+            build.log
+          if-no-files-found: warn
+          retention-days: 7
